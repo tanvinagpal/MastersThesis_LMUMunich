@@ -1,0 +1,1053 @@
+---
+title: "Thesis Related Analyses for Tumor Stage Dataset"
+author: "Tanvi Nagpal"
+date: "2024-04-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+# RNA-seq analysis for CLL dataset 2 (Tumor Stage Dataset):
+
+# Packages
+
+```{r }
+library(DESeq2)
+library(edgeR)
+library(limma)
+library(vsn)
+library(org.Mm.eg.db)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(VennDiagram)
+library(gridExtra)
+library(topGO)
+library(ReactomePA)
+library(sva)
+library(UpSetR)
+```
+
+Load and view the data:
+
+```{r }
+# Load data
+rawcounts <- read.table("VS02_Mouse_DGE_Matrix.txt", header = TRUE, sep = "\t") 
+
+# Set rownames to first column (column has no title and contains Gene Symbols)
+rownames(rawcounts) <- rawcounts[, 1]
+rawcounts <- rawcounts[,-1]
+
+# Explore the first six observations of the raw counts
+head(rawcounts)
+
+# Explore the structure of the raw counts
+str(rawcounts)
+
+# Load meta data
+metadata <- read.csv("metadata_muc005.csv", row.names = 1, sep = ",")
+
+
+# Use the match() function to reorder the columns of the raw counts
+reorder_idx <- match(rownames(metadata), colnames(rawcounts[1:27, ]))
+# Reorder the columns of the count data
+reordered_rawcounts <- rawcounts[ , reorder_idx]
+```
+
+# DESeq2
+## Data preprocessing
+First, we create a DESeq object.
+```{r }
+dds <- DESeqDataSetFromMatrix(countData = reordered_rawcounts,
+                                   colData = metadata,
+                                   design = ~ Condition)
+```
+
+## Normalisation
+### Filter out lowly expressed genes  
+There is no need to pre-filter for low counts in the DESeq2 workflow because independent filtering occurs later when using the `results()` function. 
+  
+### Correction for library size
+Library size has to be accounted for: some genes might be very highly expressed in one sample but not in another. These genes can represent an important proportion of the total library size and cause the remaining genes to be under-sampled in that sample and hence falsely appear to be down-regulated. For each gene, the geometric mean of read counts across all samples is calculated. Every gene count is divided by the geometric mean. A sample’s size factor is the median of these ratios (skipping the genes with a geometric mean of zero). 
+```{r }
+dds <- estimateSizeFactors(dds) 
+sizeFactors(dds)
+```
+
+### Dispersion estimation
+Whether a gene is called significant depends on its log fold change and on its within-group variability (dispersion). For strongly expressed genes, the dispersion can be understood as a squared coefficient of variation. 
+```{r fig.height=4.5, fig.width=6, fig.align="center", fig.cap="Figure 1: Dispersion estimation (DESeq2). Black dots: dispersion estimates for each gene. Red trend line: shows the dispersions’ dependence on the mean. Blue dots: each gene’s estimate is shrunk towards the red line to obtain the final estimates (later used in the hypothesis test). Blue circles: genes which have high gene-wise dispersion estimates (dispersion outliers, not shrunk towards the fitted trend line)."}
+dds <- estimateDispersions(dds)
+plotDispEsts(dds)
+```
+
+### Heteroscedasticity
+A variance stabilising transformation (`vst()` function) is used to remove the dependence of the variance on the mean (heteroscedasticity). Without this, we will mainly consider the variance of the few highly expressed genes. Since count values for a gene can be zero in some conditions (and non-zero in others), a transformation of the form y = log2(n+n0) (where n represents the count values and n0 is a positive constant) is used. DESeq2 provides a way to calculate an optimal constant. This transformation uses the dispersion estimates for variance stabilisation.
+```{r fig.height=4.5, fig.width=6, fig.align="center", fig.cap="Figure 2: standard deviation of the transformed data, across samples, against the mean (DESeq2). Gene counts are plotted as hex tiles."}
+vsd <- vst(dds)
+vsdMat <- assay(vsd)
+meanSdPlot(vsdMat)
+```
+The plot shows that, after variance stabilising transformation, variance is still dependent on the mean. This means there might be possible unintended batch effects increasing variance in the dataset. A PCA will help to clarify this.
+
+## Data visualisation   
+A Principal Component Analysis (PCA) is used to check if the experimental conditions clustered by expression profile.
+```{r fig.height=5.5, fig.width=5.5, fig.align="center", fig.cap="Figure 3: Principal component analysis of the samples (DESeq2).", fig.asp=0.7}
+plotPCA(vsd, intgroup="Condition")
+```
+There is no clustering observed among the 5 genotypes. PC1 is 24% and PC2 is 16%. The unintended batch effects clearly are preventing formation of clusters and need to be taken care of.
+
+This is done by adding Surrogate Variables to the analysis. These are generated with svaseq package as shown below. Their purpose is to identify the unintended batch effects and control for them during the Deseq analysis.
+
+### SVA-seq analysis:
+
+```{r }
+#run sva seq and find surrogate variables:
+dat  <- counts(dds, normalized = TRUE)
+idx  <- rowMeans(dat) > 1
+dat  <- dat[idx, ]
+mod  <- model.matrix(~ Condition, colData(dds))
+mod0 <- model.matrix(~   1, colData(dds))
+svseq <- svaseq(dat, mod, mod0)
+svseq$sv
+
+#add the 7 surrogate variables found for the deseq analysis:
+ddssva <- dds
+ddssva$SV1 <- svseq$sv[,1]
+ddssva$SV2 <- svseq$sv[,2]
+ddssva$SV3 <- svseq$sv[,3]
+ddssva$SV4 <- svseq$sv[,4]
+ddssva$SV5 <- svseq$sv[,5]
+ddssva$SV6 <- svseq$sv[,6]
+ddssva$SV7 <- svseq$sv[,7]
+design(ddssva) <- ~ SV1 + SV2 + SV3 + SV4 + SV5 + SV6 + SV7 +Condition
+```
+
+Now that we have identified 7 Surrogate Variables for this dataset, we will see whether they indeed remove the batch effects seen previously by re-doing the VST process and plotting a new PCA plot using the `removeBatchEffect()` function from limma .
+
+```{r fig.height=5.5, fig.width=5.5, fig.align="center", fig.cap="Figure 4: Principal component analysis of the samples (DESeq2) after batch correction.", fig.asp=0.7}
+mat <- assay(vsd)
+mm <- model.matrix(~Condition, colData(vsd))
+mat <- limma::removeBatchEffect(mat, covariates=svseq$sv, design=mm)
+assay(vsd) <- mat
+plotPCA(vsd, intgroup="Condition")
+```
+This PCA Plot shows that the SVA-seq worked really well. All the genotypes separate into clusters. PC1 (19% variance) explains variance based on type of lymphoma in the genotype and PC2 (9% variance) explains the difference in dosage or strength of lymphoma (strong genotypes at the bottom, milder ones in the center and top). Thus, we can now move ahead to the Differential Gene Expression Analysis.
+
+## Differential gene expression
+First, the `DESeq()`function uses the size factors and the dispersion estimates to fit a negative binomial model and compute Wald statistics in order to retrieve DEGs. Then, the `results()`function extracts a result table from a DESeq analysis including base means across samples, log2 fold changes, standard errors, test statistics, p-values and adjusted p-values.
+
+We run Deseq analysis and then find DEG's for 5 main contrasts or pairwise comparisons from the 5 genotypes.
+```{r }
+ddssva <- DESeq(ddssva)
+
+results1_DESeq2sva <- results(ddssva,contrast=c("Condition","mild_CLL", "control_CLL"),
+                           independentFiltering=TRUE,alpha=0.05)
+results2_DESeq2sva <- results(ddssva,contrast=c("Condition","strong_CLL", "control_CLL"),
+                           independentFiltering=TRUE,alpha=0.05)
+results3_DESeq2sva <- results(ddssva,contrast=c("Condition","strong_CLL", "mild_CLL"),
+                           independentFiltering=TRUE,alpha=0.05)
+results4_DESeq2sva <- results(ddssva,contrast=c("Condition","mild_BCL", "control_CLL"),
+                              independentFiltering=TRUE,alpha=0.05)
+results5_DESeq2sva <- results(ddssva,contrast=c("Condition","mild_BCL", "mild_CLL"),
+                              independentFiltering=TRUE,alpha=0.05)
+
+summary(results1_DESeq2sva)
+
+summary(results2_DESeq2sva)
+
+summary(results3_DESeq2sva)
+
+summary(results4_DESeq2sva)
+
+summary(results5_DESeq2sva)
+```
+
+5 pairwise comparisons were done and to get the final significant number of genes for each analysis, multiple testing correction needs to be done for the 5 tests and then a table is created for all the significant DEG's in each comparison.
+
+```{r }
+# order data by decreasing log fold change and adjust p values for number of pairwise comparisons:
+fc <- abs(results1_DESeq2sva$log2FoldChange)
+results1_DESeq2sva <- results1_DESeq2sva[order(fc,decreasing=T),] 
+results1_DESeq2sva_df <- as.data.frame(results1_DESeq2sva)
+results1_DESeq2sva_df[,6] <- results1_DESeq2sva_df[,6] * 5
+
+fc <- abs(results2_DESeq2sva$log2FoldChange)
+results2_DESeq2sva <- results2_DESeq2sva[order(fc,decreasing=T),] 
+results2_DESeq2sva_df <- as.data.frame(results2_DESeq2sva)
+results2_DESeq2sva_df[,6] <- results2_DESeq2sva_df[,6] * 5
+
+fc <- abs(results3_DESeq2sva$log2FoldChange)
+results3_DESeq2sva <- results3_DESeq2sva[order(fc,decreasing=T),] 
+results3_DESeq2sva_df <- as.data.frame(results3_DESeq2sva)
+results3_DESeq2sva_df[,6] <- results3_DESeq2sva_df[,6] * 5
+
+fc <- abs(results4_DESeq2sva$log2FoldChange)
+results4_DESeq2sva <- results4_DESeq2sva[order(fc,decreasing=T),] 
+results4_DESeq2sva_df <- as.data.frame(results4_DESeq2sva)
+results4_DESeq2sva_df[,6] <- results4_DESeq2sva_df[,6] * 5
+
+fc <- abs(results5_DESeq2sva$log2FoldChange)
+results5_DESeq2sva <- results5_DESeq2sva[order(fc,decreasing=T),] 
+results5_DESeq2sva_df <- as.data.frame(results5_DESeq2sva)
+results5_DESeq2sva_df[,6] <- results5_DESeq2sva_df[,6] * 5
+
+# retrieving gene symbols from rownames:
+results1_DESeq2sva_df <- tibble::rownames_to_column(results1_DESeq2sva_df) %>%
+  dplyr::rename("SYMBOL"="rowname")
+results2_DESeq2sva_df <- tibble::rownames_to_column(results2_DESeq2sva_df) %>%
+  dplyr::rename("SYMBOL"="rowname")
+results3_DESeq2sva_df <- tibble::rownames_to_column(results3_DESeq2sva_df) %>%
+  dplyr::rename("SYMBOL"="rowname")
+results4_DESeq2sva_df <- tibble::rownames_to_column(results4_DESeq2sva_df) %>%
+  dplyr::rename("SYMBOL"="rowname")
+results5_DESeq2sva_df <- tibble::rownames_to_column(results5_DESeq2sva_df) %>%
+  dplyr::rename("SYMBOL"="rowname")
+
+#filter for significant DEGs
+DEGs_results1_DESeq2 <- results1_DESeq2sva_df %>% filter(padj<=0.05)
+DEGs_results2_DESeq2 <- results2_DESeq2sva_df %>% filter(padj<=0.05)
+DEGs_results3_DESeq2 <- results3_DESeq2sva_df %>% filter(padj<=0.05)
+DEGs_results4_DESeq2 <- results4_DESeq2sva_df %>% filter(padj<=0.05)
+DEGs_results5_DESeq2 <- results5_DESeq2sva_df %>% filter(padj<=0.05)
+
+#make a dataframe showing no. of significant DEG's in each comparison:
+significant_DEGs_deseq2 <- data.frame(
+  Contrasts = c("Mild CLL vs Control CLL", "Strong CLL vs Control CLL", "Strong CLL vs Mild CLL", "Mild BCL vs Control CLL", "Mild BCL vs Mild CLL"),
+  Significant_DEGs = c(9,6,39,29,58)
+)
+significant_DEGs_deseq2
+```
+<br/>
+<div class = "blue"> **With DESeq2:** the highest number of significant Differentially Expressed Genes (DEGs) (p < 0.05) were observed in each pairwise comparison after multiple testing correction for both number of genes and number of pairwise comparisons. Total significant DEGs across all the pairwise comparisons: 141. </div>
+<br/>
+
+## GO analysis
+```{r}
+# build df with all assessed genes for each contrast:
+GO1_DESeq2 <- results1_DESeq2sva_df
+GO2_DESeq2 <- results2_DESeq2sva_df
+GO3_DESeq2 <- results3_DESeq2sva_df
+GO4_DESeq2 <- results4_DESeq2sva_df
+GO5_DESeq2 <- results5_DESeq2sva_df
+
+# filter out missing adjusted pvalues
+GO1_DESeq2 <- filter(GO1_DESeq2,padj!="NA")
+GO2_DESeq2 <- filter(GO2_DESeq2,padj!="NA")
+GO3_DESeq2 <- filter(GO3_DESeq2,padj!="NA")
+GO4_DESeq2 <- filter(GO4_DESeq2,padj!="NA")
+GO5_DESeq2 <- filter(GO5_DESeq2,padj!="NA")
+
+# retrieve adjusted pvalues
+allGenes1_DESeq2 <- GO1_DESeq2[,7]
+allGenes2_DESeq2 <- GO2_DESeq2[,7]
+allGenes3_DESeq2 <- GO3_DESeq2[,7]
+allGenes4_DESeq2 <- GO4_DESeq2[,7]
+allGenes5_DESeq2 <- GO5_DESeq2[,7]
+
+# retrieve gene symbols
+names(allGenes1_DESeq2) <- GO1_DESeq2[,1]
+names(allGenes2_DESeq2) <- GO2_DESeq2[,1]
+names(allGenes3_DESeq2) <- GO3_DESeq2[,1]
+names(allGenes4_DESeq2) <- GO4_DESeq2[,1]
+names(allGenes5_DESeq2) <- GO5_DESeq2[,1]
+
+# filter for significant DEGs (adjusted pvalue <=0.05)
+top_diff_genes <- function(x){return(x<=0.05)}
+
+# GO analysis for each contrast:
+GOdata1_DESeq2 <- new("topGOdata",ontology="BP",allGenes=allGenes1_DESeq2,
+                     geneSel=top_diff_genes,ID="SYMBOL",
+                     mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher1_DESeq2 <- runTest(GOdata1_DESeq2,algorithm="elim",statistic="fisher")
+allRes1_DESeq2 <- GenTable(GOdata1_DESeq2,classic=fisher1_DESeq2,
+                          orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata2_DESeq2 <- new("topGOdata",ontology="BP",allGenes=allGenes2_DESeq2,
+                      geneSel=top_diff_genes,ID="SYMBOL",
+                      mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher2_DESeq2 <- runTest(GOdata2_DESeq2,algorithm="elim",statistic="fisher")
+allRes2_DESeq2 <- GenTable(GOdata2_DESeq2,classic=fisher2_DESeq2,
+                           orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata3_DESeq2 <- new("topGOdata",ontology="BP",allGenes=allGenes3_DESeq2,
+                      geneSel=top_diff_genes,ID="SYMBOL",
+                      mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher3_DESeq2 <- runTest(GOdata3_DESeq2,algorithm="elim",statistic="fisher")
+allRes3_DESeq2 <- GenTable(GOdata3_DESeq2,classic=fisher3_DESeq2,
+                           orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata4_DESeq2 <- new("topGOdata",ontology="BP",allGenes=allGenes4_DESeq2,
+                      geneSel=top_diff_genes,ID="SYMBOL",
+                      mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher4_DESeq2 <- runTest(GOdata4_DESeq2,algorithm="elim",statistic="fisher")
+allRes4_DESeq2 <- GenTable(GOdata4_DESeq2,classic=fisher4_DESeq2,
+                           orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata5_DESeq2 <- new("topGOdata",ontology="BP",allGenes=allGenes5_DESeq2,
+                      geneSel=top_diff_genes,ID="SYMBOL",
+                      mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher5_DESeq2 <- runTest(GOdata5_DESeq2,algorithm="elim",statistic="fisher")
+allRes5_DESeq2 <- GenTable(GOdata5_DESeq2,classic=fisher5_DESeq2,
+                           orderBy="fisher",ranksOf="classic",topNodes=500)
+```
+
+```{r fig.height=3.0, fig.width=5.5, fig.align="center", fig.cap="Figure 5: GO Terms for significant DEGs in pairwise comparison 1: Mild CLL vs Control."}
+# plot network graph #installed Rgraphviz package for contrast 1:
+showSigOfNodes(GOdata1_DESeq2,score(fisher1_DESeq2), 
+               firstSigNodes=5,useInfo='all' )
+```
+
+```{r fig.height=3.0, fig.width=5.5, fig.align="center", fig.cap="Figure 6: GO Terms for significant DEGs in pairwise comparison 2: Strong CLL vs Control."}
+# plot network graph for contrast 2:
+showSigOfNodes(GOdata2_DESeq2,score(fisher2_DESeq2), 
+               firstSigNodes=5,useInfo='all' )
+```
+
+```{r fig.height=3.0, fig.width=5.5, fig.align="center", fig.cap="Figure 7: GO Terms for significant DEGs in pairwise comparison 3: Strong CLL vs Mild CLL."}
+# plot network graph for contrast 3: 
+showSigOfNodes(GOdata3_DESeq2,score(fisher3_DESeq2), 
+               firstSigNodes=5,useInfo='all' )
+```
+
+```{r fig.height=3.0, fig.width=5.5, fig.align="center", fig.cap="Figure 8: GO Terms for significant DEGs in pairwise comparison 4: Mild BCL vs Control CLL."}
+# plot network graph for contrast 4:
+showSigOfNodes(GOdata4_DESeq2,score(fisher4_DESeq2), 
+               firstSigNodes=5,useInfo='all' )
+```
+
+```{r fig.height=3.0, fig.width=5.5, fig.align="center", fig.cap="Figure 9: GO Terms for significant DEGs in pairwise comparison 5: Mild BCL vs Mild CLL."}
+# plot network graph for contrast 5: 
+showSigOfNodes(GOdata5_DESeq2,score(fisher5_DESeq2), 
+               firstSigNodes=5,useInfo='all' )
+```
+
+## Pathway analysis
+```{r}
+# add Entrez IDs (ReactomePA works with Entrez IDs)
+entrez1_DESeq2 <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs_results1_DESeq2[,1],
+                                       keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs1_DESeq2 <- left_join(DEGs_results1_DESeq2,entrez1_DESeq2,by="SYMBOL")
+
+entrez2_DESeq2 <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs_results2_DESeq2[,1],
+                                       keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs2_DESeq2 <- left_join(DEGs_results2_DESeq2,entrez2_DESeq2,by="SYMBOL")
+
+entrez3_DESeq2 <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs_results3_DESeq2[,1],
+                                       keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs3_DESeq2 <- left_join(DEGs_results3_DESeq2,entrez3_DESeq2,by="SYMBOL")
+
+entrez4_DESeq2 <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs_results4_DESeq2[,1],
+                                       keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs4_DESeq2 <- left_join(DEGs_results4_DESeq2,entrez4_DESeq2,by="SYMBOL")
+
+entrez5_DESeq2 <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs_results5_DESeq2[,1],
+                                       keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs5_DESeq2 <- left_join(DEGs_results5_DESeq2,entrez5_DESeq2,by="SYMBOL")
+
+# retrieve logFC and gene names for cnetplot
+lfc1 <- path_DEGs1_DESeq2$log2FoldChange
+names(lfc1) <- path_DEGs1_DESeq2$SYMBOL
+
+lfc2 <- path_DEGs2_DESeq2$log2FoldChange
+names(lfc2) <- path_DEGs2_DESeq2$SYMBOL
+
+lfc3 <- path_DEGs3_DESeq2$log2FoldChange
+names(lfc3) <- path_DEGs3_DESeq2$SYMBOL
+
+lfc4 <- path_DEGs4_DESeq2$log2FoldChange
+names(lfc4) <- path_DEGs4_DESeq2$SYMBOL
+
+lfc5 <- path_DEGs5_DESeq2$log2FoldChange
+names(lfc5) <- path_DEGs5_DESeq2$SYMBOL
+
+# pathway enrichment analysis
+path1_DESeq2 <- enrichPathway(gene=path_DEGs1_DESeq2$ENTREZID,pvalueCutoff=0.1,
+                             organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path1_DESeq2_df <- as.data.frame(path1_DESeq2)
+
+path2_DESeq2 <- enrichPathway(gene=path_DEGs2_DESeq2$ENTREZID,pvalueCutoff=0.1,
+                              organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path2_DESeq2_df <- as.data.frame(path2_DESeq2)
+
+path3_DESeq2 <- enrichPathway(gene=path_DEGs3_DESeq2$ENTREZID,pvalueCutoff=0.1,
+                              organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path3_DESeq2_df <- as.data.frame(path3_DESeq2)
+
+path4_DESeq2 <- enrichPathway(gene=path_DEGs4_DESeq2$ENTREZID,pvalueCutoff=0.1,
+                              organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path4_DESeq2_df <- as.data.frame(path4_DESeq2)
+
+path5_DESeq2 <- enrichPathway(gene=path_DEGs5_DESeq2$ENTREZID,pvalueCutoff=0.1,
+                              organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path5_DESeq2_df <- as.data.frame(path5_DESeq2)
+
+# dotplot of ten most enriched pathways
+path1_dot_DESeq2 <- dotplot(path1_DESeq2,showCategory=10)+ggtitle("Comp1") 
+path2_dot_DESeq2 <- dotplot(path2_DESeq2,showCategory=10)+ggtitle("Comp2")
+path3_dot_DESeq2 <- dotplot(path3_DESeq2,showCategory=10)+ggtitle("Comp3")
+path4_dot_DESeq2 <- dotplot(path4_DESeq2,showCategory=10)+ggtitle("Comp4")
+path5_dot_DESeq2 <- dotplot(path5_DESeq2,showCategory=10)+ggtitle("Comp5")
+
+# cnetplot of the five most enriched pathways
+path1_cnet_DESeq2 <- cnetplot(path1_DESeq2,foldChange=lfc1,vertex.label.cex=1.2,
+                             categorySize="geneNum")+ggtitle("Comp1")
+path2_cnet_DESeq2 <- cnetplot(path2_DESeq2,foldChange=lfc2,vertex.label.cex=1.2,
+                              categorySize="geneNum")+ggtitle("Comp2")
+path3_cnet_DESeq2 <- cnetplot(path3_DESeq2,foldChange=lfc3,vertex.label.cex=1.2,
+                              categorySize="geneNum")+ggtitle("Comp3")
+path4_cnet_DESeq2 <- cnetplot(path4_DESeq2,foldChange=lfc4,vertex.label.cex=1.2,
+                              categorySize="geneNum")+ggtitle("Comp4")
+path5_cnet_DESeq2 <- cnetplot(path5_DESeq2,foldChange=lfc5,vertex.label.cex=1.2,
+                              categorySize="geneNum")+ggtitle("Comp5")
+```
+
+
+# edgeR
+## Data preprocessing
+First, we create a DGElist. 
+```{r}
+# Create a new 'genes' column from the loaded data, then create DGElist:
+reordered_rawcounts2 <- reordered_rawcounts
+reordered_rawcounts2 <- tibble::rownames_to_column(reordered_rawcounts2 , "genes") 
+dge <-DGEList(counts=reordered_rawcounts2[,2:33], genes=reordered_rawcounts2[,1], group=metadata$Condition)
+```
+The first part of the edgeR workflow is nearly identical to the Limma-voom pipeline until the analysis of differentially expressed genes.  
+```{r}
+design_edgeR <- model.matrix(~metadata$Condition)
+```
+The design setup will later be used for the dispersion estimates and for the differential gene expression analysis.
+  
+## Normalisation
+### Filter out lowly expressed genes  
+Genes are dropped if they are not expressed in all the samples for any of the conditions. This allows to only keep genes that are expressed at a biologically meaningful level, to better estimate the mean-variance relationship in the data and reduces the number of statistical tests that need to be carried out when looking at differential expression. By default, the function `filterByExpr()` keeps genes with about 10 read counts or more in a minimum number of samples, where the number of samples is chosen according to the minimum group sample size. The data is filtered with counts-per-million (CPM; `cpm()`) rather than with the counts directly because the latter does not account for differences in library sizes between samples.
+```{r}
+cpm <- cpm(dge)
+keep.exprs <- filterByExpr(dge,group=dge$group)
+dge <- dge[keep.exprs,keep.lib.sizes=FALSE]
+```
+`r length(dge$counts[,1])` genes are kept for the rest of the analysis after this step.
+
+### Correction for the library sizes 
+Normalisation by the method of trimmed mean of M-values (TMM) is performed (`normLibSizes()`). The normalisation factors calculated here are used as a scaling factor for the library sizes. A normalisation factor below one indicates that a small number of high count genes are monopolizing the sequencing, causing the counts for other genes to be lower than would be usual given the library size. In this case, the library size is scaled down. Conversely, a normalisation factor above one scales up the library size.
+```{r}
+dge <- normLibSizes(dge,method="TMM")
+kable(dge$samples,caption="Table 1: library sizes and normalisation factors for each sample.") %>%
+  kable_styling(bootstrap_options="striped",full_width=F)
+```
+The dge object is copied as from this point onwards the edgeR and Limma-voom workflows diverge.
+```{r}
+dge_edgeR <- dge
+dge_limmavoom <- dge
+```
+
+### Dispersion estimation
+edgeR uses the negative binomial distribution to model the read counts for each gene in each sample. The `estimateDisp()` function estimates a dispersion for each individual gene, a common dispersion (global dispersion estimate averaged over all genes) and a trended dispersion (dispersion of a gene predicted from its abundance). 
+```{r fig.height=4.5, fig.width=6, fig.align = "center", fig.cap="Figure 10: Dispersion estimation (edgeR). Biological coefficient of variation (square root of dispersions) against the average abundance of each gene (log2-CPM). Square-root estimates of the common, trended and tagwise negative binomial dispersions are represented."}
+dge_edgeR <- estimateDisp(dge_edgeR,design_edgeR)
+plotBCV(dge_edgeR)
+```
+For RNA-seq studies, the negative binomial dispersions tend to be higher for genes with very low counts. The dispersion trend tends to decrease smoothly with abundance and to asymptotic to a constant value for genes with larger counts. But in this case, the decrease is not quite smooth, indicating unexpected variation in the dataset.
+
+## Data visualisation
+A multi-dimensional scaling plot is used to cluster the samples in two dimensions. The distance between each sample represents the leading log fold change for the genes that best distinguish those samples. The leading fold change is defined as the mean-root-square of the largest 500 log2-fold changes between a pair of samples.
+```{r include=FALSE}
+attach(dge_edgeR$samples)
+```
+```{r fig.height=5, fig.width=5, fig.align="center", fig.cap="Figure 11: Multidimensional scaling plot of distances between gene expression profiles (Limma-voom and edgeR). Distances on the plot approximate the typical log2 fold changes between the samples."}
+plotMDS(dge_edgeR,col=c("violet","violet","violet", "violet", "tomato", "gold",
+                        "gold", "gold", "gold", "gold", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen"),pch=19)
+legend("bottomright",legend=c("control_CLL","mild_BCL", "strong_BCL", "mild_CLL","strong_CLL"),
+       col=c("steelblue","violet", "tomato", "seagreen", "gold"),pch=19)
+```
+```{r include=FALSE}
+detach(dge_edgeR$samples)
+```
+Similarly to Figure 3, the samples don't cluster well and indicate presence of batch effects which we will again correct for, using Surrogate Variables through SVA-seq analysis. 
+
+### SVA-seq analysis:
+  
+```{r }
+#run sva seq on the log cpm values and find surrogate variables:
+dat2  <- cpm(dge_edgeR$counts, log=TRUE)
+idx2  <- rowMeans(dat2) > 1
+dat2  <- dat2[idx2, ]
+Group <- dge_edgeR$samples$group
+mod_e  <- model.matrix(~Group)
+colnames(mod_e)[-1] <- paste0(levels(Group)[-1], "vs", levels(Group)[1])
+svseq_e <- svaseq(dat2, mod_e, mod_e[,1])
+svseq_e$sv
+
+#remove batch effects for visualising (6 surrogate variables chosen as explained below):
+logCPM <- cpm(dge_edgeR,log=TRUE)
+batchy <- svseq_e$sv
+batchy1 <- batchy[,1:6]
+logCPM <- removeBatchEffect(logCPM,covariates=batchy1, design = design_edgeR)
+```
+7 Surrogate variables are found through SVA-seq analysis. Out of these, 6 are chosen for removing batch effects using limma's `removeBatchEffect()` function. This is because on testing different combinations of the surrogate variables, 6 work as well as 7 of them in clustering the samples as will be seen in the MDS plot below. This means we avoid over-correction of the dataset and allow for some natural biological variation in it while taking care of the technical variation.
+
+```{r fig.height=4.5, fig.width=6, fig.align = "center", fig.cap="Figure 12: New BCV plot after batch correction."}
+#add surrogate variables to metadata:
+metadata.sv <- cbind(metadata, svseq_e$sv)
+
+colnames(metadata.sv)[4:10] <- paste0("sv", 1:7)
+
+#create new model design with 6 surrogate variables as covariates:
+design_edgeR2 <- model.matrix(~ 0 + metadata.sv$sv1 + metadata.sv$sv2 + metadata.sv$sv3 + metadata.sv$sv4 + metadata.sv$sv5 + metadata.sv$sv6 + metadata.sv$Condition)
+
+colnames(design_edgeR2) <- c('SV1','SV2','SV3', 'SV4', 'SV5', 'SV6', 'Control', 'mild_BCL', 'mild_CLL', 'strong_BCL', 'strong_CLL') 
+
+#re-estimate dispersion and plot BCV again:
+dge_edgeR.sv <- estimateDisp(dge_edgeR,design_edgeR2)
+plotBCV(dge_edgeR.sv)
+```  
+There is a big change in dispersion observed as the BCV is now much lower for lower cpm, showing decreased variation after inclusion of surrogate variables. Next, we create a new MDS plot.
+  
+```{r include=FALSE}
+attach(dge_edgeR$samples)
+```
+```{r fig.height=5, fig.width=5, fig.align="center", fig.cap="Figure 13: New MDS plot after batch correction."}
+plotMDS(logCPM,col=c("violet","violet","violet", "violet", "tomato", "gold",
+                        "gold", "gold", "gold", "gold", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "steelblue", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen", "seagreen"),pch=19)
+legend("bottomright",legend=c("control_CLL","mild_BCL", "strong_BCL", "mild_CLL","strong_CLL"),
+       col=c("steelblue","violet", "tomato", "seagreen", "gold"),pch=19)
+```
+  
+```{r include=FALSE}
+detach(dge_edgeR$samples)
+``` 
+  
+A clear separation of clusters is observed after batch effect removal in the new MDS plot. The first dimension separates based on type of lymphoma and the second dimension separates based on strength of lymphoma (just like in PCA plot for Deseq2). Therefore, SVA-seq works really well in removal of unknown and unintended batch effects. Now, we can move on to the differential gene expression analysis.   
+  
+## Differential gene expression
+edgeR uses the dispersion estimates to test whether the observed gene counts fit a negative binomial model (`glmQLFit()` and `glmQLFTest()`). Then, `topTags()` extracts the most DEGs ranked by their log FC. 
+```{r}
+
+#fit the negative binomial model:
+fit1 <- glmQLFit(dge_edgeR.sv,design_edgeR2)
+
+#setup the 5 pairwise comparisons as contrasts:
+my.contrasts <- makeContrasts(mCvscC=mild_CLL-Control, sCvscC=strong_CLL-Control, sCvsmC=strong_CLL-mild_CLL, mBvscC = mild_BCL-Control, mBvsmC = mild_BCL-mild_CLL , levels=design_edgeR2)
+
+#test each contrast:
+qlf1 <- glmQLFTest(fit1,  contrast=my.contrasts[,"mCvscC"])
+qlf2 <- glmQLFTest(fit1,  contrast=my.contrasts[,"sCvscC"])
+qlf3 <- glmQLFTest(fit1,  contrast=my.contrasts[,"sCvsmC"])
+qlf4 <- glmQLFTest(fit1,  contrast=my.contrasts[,"mBvscC"])
+qlf5 <- glmQLFTest(fit1,  contrast=my.contrasts[,"mBvsmC"])
+
+
+##checking results for each comparison:
+results1_edgeR<- topTags(qlf1,n=Inf,sort.by="logFC",adjust.method="BH")
+summary(decideTests(qlf1,p.value=0.05))
+
+results2_edgeR<- topTags(qlf2,n=Inf,sort.by="logFC",adjust.method="BH")
+summary(decideTests(qlf2,p.value=0.05))
+
+results3_edgeR<- topTags(qlf3,n=Inf,sort.by="logFC",adjust.method="BH")
+summary(decideTests(qlf3,p.value=0.05))
+
+results4_edgeR<- topTags(qlf4,n=Inf,sort.by="logFC",adjust.method="BH")
+summary(decideTests(qlf4,p.value=0.05))
+
+results5_edgeR<- topTags(qlf5,n=Inf,sort.by="logFC",adjust.method="BH")
+summary(decideTests(qlf5,p.value=0.05))
+```
+```{r}
+# retrieve gene symbols for each contrast and adjust p values for number of pairwise comparisons:
+results1_edgeR_df <- as.data.frame(results1_edgeR)
+results1_edgeR_df <- results1_edgeR_df %>% dplyr::rename("SYMBOL"="genes")
+results1_edgeR_df[,6] <- results1_edgeR_df[,6] * 5
+DEGs1_edgeR <- results1_edgeR_df %>% filter(FDR<=0.05)
+
+results2_edgeR_df <- as.data.frame(results2_edgeR)
+results2_edgeR_df <- results2_edgeR_df %>% dplyr::rename("SYMBOL"="genes")
+results2_edgeR_df[,6] <- results2_edgeR_df[,6] * 5
+DEGs2_edgeR <- results2_edgeR_df %>% filter(FDR<=0.05)
+
+results3_edgeR_df <- as.data.frame(results3_edgeR)
+results3_edgeR_df <- results3_edgeR_df %>% dplyr::rename("SYMBOL"="genes")
+results3_edgeR_df[,6] <- results3_edgeR_df[,6] * 5
+DEGs3_edgeR <- results3_edgeR_df %>% filter(FDR<=0.05)
+
+results4_edgeR_df <- as.data.frame(results4_edgeR)
+results4_edgeR_df <- results4_edgeR_df %>% dplyr::rename("SYMBOL"="genes")
+results4_edgeR_df[,6] <- results4_edgeR_df[,6] * 5
+DEGs4_edgeR <- results4_edgeR_df %>% filter(FDR<=0.05)
+
+results5_edgeR_df <- as.data.frame(results5_edgeR)
+results5_edgeR_df <- results5_edgeR_df %>% dplyr::rename("SYMBOL"="genes")
+results5_edgeR_df[,6] <- results5_edgeR_df[,6] * 5
+DEGs5_edgeR <- results5_edgeR_df %>% filter(FDR<=0.05)
+
+#make a dataframe showing significant number of DEGs:
+significant_DEGs_edgeR <- data.frame(
+  Contrasts = c("Mild CLL vs Control CLL", "Strong CLL vs Control CLL", "Strong CLL vs Mild CLL", "Mild BCL vs Control CLL", "Mild BCL vs Mild CLL"),
+  Significant_DEGs = c(0,0,1,0,5)
+)
+significant_DEGs_edgeR
+```
+<br/>
+<div class = "blue"> **With edgeR:** Only 6 genes are significantly differentially expressed among all the 5 pairwise comparisons after multiple testing correction for number of genes and number of pairwise comparisons. There is one significant DEG (FDR < 0.05) in comparison 3 (Strong CLL vs Mild CLL) which is Ighv1-75. And five significant DEGs (p < 0.05) in comparison 5 (Mild BCL vs Mild CLL) which are Eef1a1, Qars, Ier3ip1, Gm6767 and Gm6548.</div> 
+<br/>
+
+## GO analysis
+```{r}
+# build df with all assessed genes
+GO1_edgeR <- results1_edgeR_df
+GO2_edgeR <- results2_edgeR_df
+GO3_edgeR <- results3_edgeR_df
+GO4_edgeR <- results4_edgeR_df
+GO5_edgeR <- results5_edgeR_df
+
+# filter out missing adjusted pvalues
+GO1_edgeR <- filter(GO1_edgeR,FDR!="NA")
+GO2_edgeR <- filter(GO2_edgeR,FDR!="NA")
+GO3_edgeR <- filter(GO3_edgeR,FDR!="NA")
+GO4_edgeR <- filter(GO4_edgeR,FDR!="NA")
+GO5_edgeR <- filter(GO5_edgeR,FDR!="NA")
+
+# retrieve adjusted pvalues
+allGenes1_edgeR <- GO1_edgeR[,6]
+allGenes2_edgeR <- GO2_edgeR[,6]
+allGenes3_edgeR <- GO3_edgeR[,6]
+allGenes4_edgeR <- GO4_edgeR[,6]
+allGenes5_edgeR <- GO5_edgeR[,6]
+
+# retrieve symbols
+names(allGenes1_edgeR) <- GO1_edgeR[,1]
+names(allGenes2_edgeR) <- GO2_edgeR[,1]
+names(allGenes3_edgeR) <- GO3_edgeR[,1]
+names(allGenes4_edgeR) <- GO4_edgeR[,1]
+names(allGenes5_edgeR) <- GO5_edgeR[,1]
+
+
+# filter for significant DEGs (adjusted pvalue <=0.05)
+top_diff_genes <- function(x){return(x<=0.05)}
+
+# GO analysis
+GOdata1_edgeR <- new("topGOdata",ontology="BP",allGenes=allGenes1_edgeR,
+                      geneSel=top_diff_genes,ID="SYMBOL",
+                      mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher1_edgeR <- runTest(GOdata1_edgeR,algorithm="elim",statistic="fisher")
+allRes1_edgeR <- GenTable(GOdata1_edgeR,classic=fisher1_edgeR,
+                           orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata2_edgeR <- new("topGOdata",ontology="BP",allGenes=allGenes2_edgeR,
+                      geneSel=top_diff_genes,ID="SYMBOL",
+                      mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher2_edgeR <- runTest(GOdata2_edgeR,algorithm="elim",statistic="fisher")
+allRes2_edgeR <- GenTable(GOdata2_edgeR,classic=fisher2_edgeR,
+                           orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata3_edgeR <- new("topGOdata",ontology="BP",allGenes=allGenes3_edgeR,
+                      geneSel=top_diff_genes,ID="SYMBOL",
+                      mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher3_edgeR <- runTest(GOdata3_edgeR,algorithm="elim",statistic="fisher")
+allRes3_edgeR <- GenTable(GOdata3_edgeR,classic=fisher3_edgeR,
+                           orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata4_edgeR <- new("topGOdata",ontology="BP",allGenes=allGenes4_edgeR,
+                      geneSel=top_diff_genes,ID="SYMBOL",
+                      mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher4_edgeR <- runTest(GOdata4_edgeR,algorithm="elim",statistic="fisher")
+allRes4_edgeR <- GenTable(GOdata4_edgeR,classic=fisher4_edgeR,
+                           orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata5_edgeR <- new("topGOdata",ontology="BP",allGenes=allGenes5_edgeR,
+                      geneSel=top_diff_genes,ID="SYMBOL",
+                      mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher5_edgeR <- runTest(GOdata5_edgeR,algorithm="elim",statistic="fisher")
+allRes5_edgeR <- GenTable(GOdata5_edgeR,classic=fisher5_edgeR,
+                           orderBy="fisher",ranksOf="classic",topNodes=500)
+```
+
+```{r fig.height=3.0, fig.width=5.5, fig.align="center", fig.cap="Figure 16: GO Terms for significant DEGs in pairwise comparison 3: Strong CLL vs Mild CLL for edgeR."}
+# plot network graph for contrast 3: 
+showSigOfNodes(GOdata3_edgeR,score(fisher3_edgeR), 
+               firstSigNodes=5,useInfo='all' )
+```
+
+```{r fig.height=3.0, fig.width=5.5, fig.align="center", fig.cap="Figure 17: GO Terms for significant DEGs in pairwise comparison 5: Mild BCL vs Mild CLL for edgeR."}
+# plot network graph for contrast 5: 
+showSigOfNodes(GOdata5_edgeR,score(fisher5_edgeR), 
+               firstSigNodes=5,useInfo='all' )
+```
+
+## Pathway analysis
+```{r}
+# add Entrez IDs (ReactomePA works with Entrez IDs)
+entrez1_edgeR <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs1_edgeR[,1],
+                                        keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs1_edgeR <- left_join(DEGs1_edgeR,entrez1_edgeR,by="SYMBOL")
+
+entrez2_edgeR <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs2_edgeR[,1],
+                                        keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs2_edgeR <- left_join(DEGs2_edgeR,entrez2_edgeR,by="SYMBOL")
+
+entrez3_edgeR <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs3_edgeR[,1],
+                                        keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs3_edgeR <- left_join(DEGs3_edgeR,entrez3_edgeR,by="SYMBOL")
+
+entrez4_edgeR <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs4_edgeR[,1],
+                                        keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs4_edgeR <- left_join(DEGs4_edgeR,entrez4_edgeR,by="SYMBOL")
+
+entrez5_edgeR <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs5_edgeR[,1],
+                                        keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs5_edgeR <- left_join(DEGs5_edgeR,entrez5_edgeR,by="SYMBOL")
+
+# retrieve logFC and gene names for cnetplot
+lfc1 <- path_DEGs1_edgeR$logFC
+names(lfc1) <- path_DEGs1_edgeR$SYMBOL
+
+lfc2 <- path_DEGs2_edgeR$logFC
+names(lfc2) <- path_DEGs2_edgeR$SYMBOL
+
+lfc3 <- path_DEGs3_edgeR$logFC
+names(lfc3) <- path_DEGs3_edgeR$SYMBOL
+
+lfc4 <- path_DEGs4_edgeR$logFC
+names(lfc4) <- path_DEGs4_edgeR$SYMBOL
+
+lfc5 <- path_DEGs5_edgeR$logFC
+names(lfc5) <- path_DEGs5_edgeR$SYMBOL
+
+
+# pathway enrichment analysis
+path1_edgeR <- enrichPathway(gene=path_DEGs1_edgeR$ENTREZID,pvalueCutoff=0.1,
+                              organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path1_edgeR_df <- as.data.frame(path1_edgeR)
+
+path2_edgeR <- enrichPathway(gene=path_DEGs2_edgeR$ENTREZID,pvalueCutoff=0.1,
+                              organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path2_edgeR_df <- as.data.frame(path2_edgeR)
+
+path3_edgeR <- enrichPathway(gene=path_DEGs3_edgeR$ENTREZID,pvalueCutoff=0.1,
+                              organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path3_edgeR_df <- as.data.frame(path3_edgeR)
+
+path4_edgeR <- enrichPathway(gene=path_DEGs4_edgeR$ENTREZID,pvalueCutoff=0.1,
+                              organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path4_edgeR_df <- as.data.frame(path4_edgeR)
+
+path5_edgeR <- enrichPathway(gene=path_DEGs5_edgeR$ENTREZID,pvalueCutoff=0.1,
+                              organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path5_edgeR_df <- as.data.frame(path5_edgeR)
+
+
+# dotplot of ten most enriched pathways
+path5_dot_edgeR <- dotplot(path5_edgeR,showCategory=10)+ggtitle("Comp5")
+
+# cnetplot of the five most enriched pathways
+path5_cnet_edgeR <- cnetplot(path5_edgeR,foldChange=lfc5,vertex.label.cex=1.2,
+                              categorySize="geneNum")+ggtitle("Comp5")
+```
+
+
+# Limma-voom
+As mentioned above, data preprocessing and the normalisation steps are nearly identical to what has been done with edgeR.  
+  
+## Data preprocessing
+The design setup will be later used for the differential gene expression analysis.
+```{r}
+design_limmavoom <- model.matrix(~ 0 + metadata.sv$sv1 + metadata.sv$sv2 + metadata.sv$sv3 + metadata.sv$sv4 + metadata.sv$sv5 + metadata.sv$sv6 + metadata.sv$Condition)
+
+colnames(design_limmavoom) <- c('SV1','SV2','SV3', 'SV4', 'SV5', 'SV6', 'Control', 'mild_BCL', 'mild_CLL', 'strong_BCL', 'strong_CLL') 
+
+contr.matrix <- makeContrasts(mCvscC=mild_CLL-Control, sCvscC=strong_CLL-Control, sCvsmC=strong_CLL-mild_CLL, mBvscC = mild_BCL-Control, mBvsmC = mild_BCL-mild_CLL , levels=colnames(design_limmavoom))
+
+```
+
+## Normalisation
+### Heteroscedasticity 
+In Limma, linear modelling is carried out on the log-CPM values which are assumed to be normally distributed and the mean-variance relationship is accommodated using precision weights calculated by the `voom()` function.
+```{r fig.height=4.5, fig.width=6, fig.align = "center", fig.cap="Figure 18: Mean-variance trend plot of the mean expression of each gene vs the square-root of standard deviations (Limma-voom) on batch corrected data."}
+v <- voom(dge_limmavoom,design_limmavoom,plot=TRUE)
+```
+Usually, the mean variance trend plot shows a decreasing trend between the means and variances resulting from a combination of technical variation and biological variation among the samples. Experiments with high biological variation result in flatter trends, where variance values plateau at high expression values.  
+  
+## Data visualisation
+See Figures 11 and 13.  
+  
+## Differential gene expression
+Limma fits a linear model through the data and carries out an empirical Bayes moderation (`lmFit()`, `contrasts.fit()` and `eBayes()`). The model’s residual variances are plotted against average expression values. It can be seen from this plot that the variance is no longer dependent on the mean expression level.
+```{r fig.height=4.5, fig.width=6, fig.align = "center", fig.cap="Figure 19: Sigma vs A plot of residual standard deviation vs average log expression (Limma-voom). The average log2 residual standard deviation is marked by a horizontal blue line."}
+vfit <- lmFit(v,design_limmavoom)
+vfit <- contrasts.fit(vfit,contrasts=contr.matrix)
+efit <- eBayes(vfit)
+plotSA(efit)
+```
+
+```{r}
+# extract a table of the top-ranked genes from a linear model fit coefficient (contrast) wise:
+results_limma1 <- topTable(efit,coef = 1, number=Inf,sort.by="logFC")
+results_limma2 <- topTable(efit,coef = 2, number=Inf,sort.by="logFC")
+results_limma3 <- topTable(efit,coef = 3, number=Inf,sort.by="logFC")
+results_limma4 <- topTable(efit,coef = 4, number=Inf,sort.by="logFC")
+results_limma5 <- topTable(efit,coef = 5, number=Inf,sort.by="logFC")
+
+# identify DEGs for each contrast after multiple testing correction across genes and pairwise comparisons:
+dt1 <- decideTests(efit, method = "global")
+summary(dt1)
+```
+```{r}
+# retrieve gene symbols for each contrast and adjust p values for number of pairwise comparisons::
+results1_limma_df <- as.data.frame(results_limma1)
+results1_limma_df <- results1_limma_df %>% dplyr::rename("SYMBOL"="genes")
+results1_limma_df[,6] <- results1_limma_df[,6] * 5
+DEGs1_limma <- results1_limma_df %>% filter(adj.P.Val<=0.05)
+
+results2_limma_df <- as.data.frame(results_limma2)
+results2_limma_df <- results2_limma_df %>% dplyr::rename("SYMBOL"="genes")
+results2_limma_df[,6] <- results2_limma_df[,6] * 5
+DEGs2_limma <- results2_limma_df %>% filter(adj.P.Val<=0.05)
+
+results3_limma_df <- as.data.frame(results_limma3)
+results3_limma_df <- results3_limma_df %>% dplyr::rename("SYMBOL"="genes")
+results3_limma_df[,6] <- results3_limma_df[,6] * 5
+DEGs3_limma <- results3_limma_df %>% filter(adj.P.Val<=0.05)
+
+results4_limma_df <- as.data.frame(results_limma4)
+results4_limma_df <- results4_limma_df %>% dplyr::rename("SYMBOL"="genes")
+results4_limma_df[,6] <- results4_limma_df[,6] * 5
+DEGs4_limma <- results4_limma_df %>% filter(adj.P.Val<=0.05)
+
+results5_limma_df <- as.data.frame(results_limma5)
+results5_limma_df <- results5_limma_df %>% dplyr::rename("SYMBOL"="genes")
+results5_limma_df[,6] <- results5_limma_df[,6] * 5
+DEGs5_limma <- results5_limma_df %>% filter(adj.P.Val<=0.05)
+```
+
+<br/>
+<div class = "blue"> **With Limma-voom:** only five significant DEGs (p < 0.05) are observed in total. These belong to comparison 5 (Mild BCL vs Mild CLL): Eef1a1, Defa24, Qars, Pepd and Ier3ip1. This is after multiple testing correction for both number of genes and number of pairwise comparisons ("global" method).</div> 
+<br/>
+
+## GO analysis
+```{r}
+# build df with all assessed genes
+GO1_limma <- results1_limma_df
+GO2_limma <- results2_limma_df
+GO3_limma <- results3_limma_df
+GO4_limma <- results4_limma_df
+GO5_limma <- results5_limma_df
+
+# filter out missing adjusted pvalues
+GO1_limma <- filter(GO1_limma,adj.P.Val!="NA")
+GO2_limma <- filter(GO2_limma,adj.P.Val!="NA")
+GO3_limma <- filter(GO3_limma,adj.P.Val!="NA")
+GO4_limma <- filter(GO4_limma,adj.P.Val!="NA")
+GO5_limma <- filter(GO5_limma,adj.P.Val!="NA")
+
+# retrieve adjusted pvalues
+allGenes1_limma <- GO1_limma[,6]
+allGenes2_limma <- GO2_limma[,6]
+allGenes3_limma <- GO3_limma[,6]
+allGenes4_limma <- GO4_limma[,6]
+allGenes5_limma <- GO5_limma[,6]
+
+# retrieve symbols
+names(allGenes1_limma) <- GO1_limma[,1]
+names(allGenes2_limma) <- GO2_limma[,1]
+names(allGenes3_limma) <- GO3_limma[,1]
+names(allGenes4_limma) <- GO4_limma[,1]
+names(allGenes5_limma) <- GO5_limma[,1]
+
+# GO analysis
+GOdata1_limma <- new("topGOdata",ontology="BP",allGenes=allGenes1_limma,
+                     geneSel=top_diff_genes,ID="SYMBOL",
+                     mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher1_limma <- runTest(GOdata1_limma,algorithm="elim",statistic="fisher")
+allRes1_limma <- GenTable(GOdata1_limma,classic=fisher1_limma,
+                          orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata2_limma <- new("topGOdata",ontology="BP",allGenes=allGenes2_limma,
+                     geneSel=top_diff_genes,ID="SYMBOL",
+                     mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher2_limma <- runTest(GOdata2_limma,algorithm="elim",statistic="fisher")
+allRes2_limma <- GenTable(GOdata2_limma,classic=fisher2_limma,
+                          orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata3_limma <- new("topGOdata",ontology="BP",allGenes=allGenes3_limma,
+                     geneSel=top_diff_genes,ID="SYMBOL",
+                     mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher3_limma <- runTest(GOdata3_limma,algorithm="elim",statistic="fisher")
+allRes3_limma <- GenTable(GOdata3_limma,classic=fisher3_limma,
+                          orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata4_limma <- new("topGOdata",ontology="BP",allGenes=allGenes4_limma,
+                     geneSel=top_diff_genes,ID="SYMBOL",
+                     mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher4_limma <- runTest(GOdata4_limma,algorithm="elim",statistic="fisher")
+allRes4_limma <- GenTable(GOdata4_limma,classic=fisher4_limma,
+                          orderBy="fisher",ranksOf="classic",topNodes=500)
+
+GOdata5_limma <- new("topGOdata",ontology="BP",allGenes=allGenes5_limma,
+                     geneSel=top_diff_genes,ID="SYMBOL",
+                     mapping="org.Mm.eg.db",annot=annFUN.org)
+fisher5_limma <- runTest(GOdata5_limma,algorithm="elim",statistic="fisher")
+allRes5_limma <- GenTable(GOdata5_limma,classic=fisher5_limma,
+                          orderBy="fisher",ranksOf="classic",topNodes=500)
+```
+
+```{r fig.height=3.0, fig.width=5.5, fig.align="center", fig.cap="Figure 20: GO Terms for significant DEGs in pairwise comparison 5: Mild BCL vs Mild CLL for limma-voom."}
+# plot network graph for contrast 5: 
+showSigOfNodes(GOdata5_limma,score(fisher5_limma), 
+               firstSigNodes=5,useInfo='all' )
+```
+
+## Pathway analysis
+```{r}
+# add Entrez IDs (ReactomePA works with Entrez IDs)
+entrez1_limma <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs1_limma[,1],
+                                       keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs1_limma <- left_join(DEGs1_limma,entrez1_limma,by="SYMBOL")
+
+entrez2_limma <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs2_limma[,1],
+                                       keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs2_limma <- left_join(DEGs2_limma,entrez2_limma,by="SYMBOL")
+
+entrez3_limma <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs3_limma[,1],
+                                       keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs3_limma <- left_join(DEGs3_limma,entrez3_limma,by="SYMBOL")
+
+entrez4_limma <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs4_limma[,1],
+                                       keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs4_limma <- left_join(DEGs4_limma,entrez4_limma,by="SYMBOL")
+
+entrez5_limma <- AnnotationDbi::select(org.Mm.eg.db,keys=DEGs5_limma[,1],
+                                       keytype="SYMBOL",columns=c("SYMBOL","ENTREZID"))
+path_DEGs5_limma <- left_join(DEGs5_limma,entrez5_limma,by="SYMBOL")
+
+# retrieve logFC and gene names for cnetplot
+lfc1 <- path_DEGs1_limma$logFC
+names(lfc1) <- path_DEGs1_limma$SYMBOL
+
+lfc2 <- path_DEGs2_limma$logFC
+names(lfc2) <- path_DEGs2_limma$SYMBOL
+
+lfc3 <- path_DEGs3_limma$logFC
+names(lfc3) <- path_DEGs3_limma$SYMBOL
+
+lfc4 <- path_DEGs4_limma$logFC
+names(lfc4) <- path_DEGs4_limma$SYMBOL
+
+lfc5 <- path_DEGs5_limma$logFC
+names(lfc5) <- path_DEGs5_limma$SYMBOL
+
+
+# pathway enrichment analysis
+path1_limma <- enrichPathway(gene=path_DEGs1_limma$ENTREZID,pvalueCutoff=0.1,
+                             organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path1_limma_df <- as.data.frame(path1_limma)
+
+path2_limma <- enrichPathway(gene=path_DEGs2_limma$ENTREZID,pvalueCutoff=0.1,
+                             organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path2_limma_df <- as.data.frame(path2_limma)
+
+path3_limma <- enrichPathway(gene=path_DEGs3_limma$ENTREZID,pvalueCutoff=0.1,
+                             organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path3_limma_df <- as.data.frame(path3_limma)
+
+path4_limma <- enrichPathway(gene=path_DEGs4_limma$ENTREZID,pvalueCutoff=0.1,
+                             organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path4_limma_df <- as.data.frame(path4_limma)
+
+path5_limma <- enrichPathway(gene=path_DEGs5_limma$ENTREZID,pvalueCutoff=0.1,
+                             organism="mouse",pAdjustMethod="BH",readable=TRUE)
+path5_limma_df <- as.data.frame(path5_limma)
+
+
+# dotplot of ten most enriched pathways
+path5_dot_limma <- dotplot(path5_limma,showCategory=10)+ggtitle("Comp5")
+
+# cnetplot of the five most enriched pathways
+path5_cnet_limma <- cnetplot(path5_limma,foldChange=lfc5,vertex.label.cex=1.2,
+                             categorySize="geneNum")+ggtitle("Comp5")
+```
+
+
+# Comparisons using Upset plots and Venn diagrams:
+## Upset plot for common significant DEGs across contrasts and methods:
+```{r fig.align='center', fig.cap="Figure 21: Upset plot of significant Differentially Expressed genes for Tumor stage dataset 2."}
+#plot common number of significant DEGs for 5 pairwise comparisons among the 3 methods (choose only those which have DEGs for better visualisations):
+
+list1 <- list(MildCvsControl_D=DEGs_results1_DESeq2$SYMBOL,
+              StrongCvsControl_D=DEGs_results2_DESeq2$SYMBOL,
+              StrongCvsMildC_D=DEGs_results3_DESeq2$SYMBOL,
+              MildBvsControl_D=DEGs_results4_DESeq2$SYMBOL,
+              MildCvsMildB_D=DEGs_results5_DESeq2$SYMBOL,
+              StrongCvsMildC_E=DEGs3_edgeR$SYMBOL,
+              MildCvsMildB_E=DEGs5_edgeR$SYMBOL,
+              MildCvsMildB_L=DEGs5_limma$SYMBOL)
+
+UpSetR::upset(fromList(list1), nsets = 8)
+```
+
+## Upset plot for common significant Pathway terms among the comparisons and methods:
+```{r fig.align='center', fig.cap="Figure 22: Upset Plot of Significant Reactome Pathways in tumor stage dataset 2."}
+# subset significantly enriched Reactome pathways
+path_up1_DESeq2 <- subset(path1_DESeq2_df,p.adjust<=0.05)
+path_up2_DESeq2 <- subset(path2_DESeq2_df,p.adjust<=0.05)
+path_up3_DESeq2 <- subset(path3_DESeq2_df,p.adjust<=0.05)
+path_up4_DESeq2 <- subset(path4_DESeq2_df,p.adjust<=0.05)
+path_up5_DESeq2 <- subset(path5_DESeq2_df,p.adjust<=0.05)
+path_up5_edgeR <- subset(path5_edgeR_df,p.adjust<=0.05)
+path_up5_limma <- subset(path5_limma_df,p.adjust<=0.05)
+
+# plot Upset plot for pathway comparison:
+list2 <- list(MildCvsControl_D=path_up1_DESeq2$ID,
+              StrongCvsControl_D=path_up2_DESeq2$ID,
+              StrongCvsMildC_D=path_up3_DESeq2$ID,
+              MildBvsControl_D=path_up4_DESeq2$ID,
+              MildCvsMildB_D=path_up5_DESeq2$ID,
+              MildCvsMildB_E=path_up5_edgeR$ID,
+              MildCvsMildB_L=path_up5_limma$ID)
+
+UpSetR::upset(fromList(list2), nsets = 7)
+```
+
+## Venn Diagram of common significant GO terms across methods for comparison 5:
+```{r fig.height=3.5, fig.width=5.5, fig.align = "center", fig.cap="Figure 23: Venn Diagram of common Significant GO terms in tumor stage dataset 2 comparison 5 across all methods."}
+# subset significantly GO terms:
+allRes1_DESeq2_n <- allRes1_DESeq2[allRes1_DESeq2$Significant != 0, ]
+allRes2_DESeq2_n <- allRes2_DESeq2[allRes2_DESeq2$Significant != 0, ]
+allRes3_DESeq2_n <- allRes3_DESeq2[allRes3_DESeq2$Significant != 0, ]
+allRes4_DESeq2_n <- allRes4_DESeq2[allRes4_DESeq2$Significant != 0, ]
+allRes5_DESeq2_n <- allRes5_DESeq2[allRes5_DESeq2$Significant != 0, ]
+
+allRes1_edgeR_n <- allRes1_edgeR[allRes1_edgeR$Significant != 0, ]
+allRes2_edgeR_n <- allRes2_edgeR[allRes2_edgeR$Significant != 0, ]
+allRes3_edgeR_n <- allRes3_edgeR[allRes3_edgeR$Significant != 0, ]
+allRes4_edgeR_n <- allRes4_edgeR[allRes4_edgeR$Significant != 0, ]
+allRes5_edgeR_n <- allRes5_edgeR[allRes5_edgeR$Significant != 0, ]
+
+allRes1_limma_n <- allRes1_limma[allRes1_limma$Significant != 0, ]
+allRes2_limma_n <- allRes2_limma[allRes2_limma$Significant != 0, ]
+allRes3_limma_n <- allRes3_limma[allRes3_limma$Significant != 0, ]
+allRes4_limma_n <- allRes4_limma[allRes4_limma$Significant != 0, ]
+allRes5_limma_n <- allRes5_limma[allRes5_limma$Significant != 0, ]
+
+# plot Venn diagram for GO terms comparison:
+venn_list1 <- list(DESeq2=allRes5_DESeq2_n$GO.ID,
+                   edgeR=allRes5_edgeR_n$GO.ID,
+                   limmavoom=allRes5_limma_n$GO.ID)
+venn1 <- venn.diagram(venn_list1,fill=2:4,alpha=0.15,filename=NULL,
+                      main="GO terms")
+grid.arrange(gTree(children=venn1), ncol=1) #including
+```
+
+
+# Session info
+```{r}
+sessionInfo()
+```
+   
+Last updated: `r as.Date(Sys.time())`
