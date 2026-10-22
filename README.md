@@ -24,7 +24,16 @@ and their contribution to disease evolution. Further, it uncovered therapeutic t
 quality of life and prognosis of CLL patients.
 
 Files provided in the repository:
-2 RMD files which detail the pipeline used for the various analyses: DGE (3 different methods), GO and Pathway Enrichment. One dataset analysed per file.
+
+2 RMD files which detail the pipeline used for the various analyses: DGE (3 different methods), GO and Pathway Enrichment. One dataset analysed per file. Their html versions can be downloaded and viewed for better readability. 
+
+View the dataset 2 analysis first, as it was done before analysing dataset 1. 
+
 21 figures in the figures folder. These visualise the results of each of the analyses, ranging from quality control to results of these analyses.
+
 Raw Data is not provided but can be enquired about on request.
+
 A pdf of the thesis containing further details of literature review, methods and results can also be provided on request.
+
+Thesis Advisor: Dr. Sonja Grath, LMU Munich
+Datasets provided by: Prof. Dr. Marc Schmidt-Supprian and Dr. Valeria Soberon from Technical University of Munich (TUM).
