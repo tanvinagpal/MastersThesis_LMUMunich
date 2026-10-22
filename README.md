@@ -27,4 +27,4 @@ Files provided in the repository:
 2 RMD files which detail the pipeline used for the various analyses: DGE (3 different methods), GO and Pathway Enrichment. One dataset analysed per file.
 21 figures in the figures folder. These visualise the results of each of the analyses, ranging from quality control to results of these analyses.
 Raw Data is not provided but can be enquired about on request.
-A pdf of the thesis containing further details of literature review and results can also be provided on request.
+A pdf of the thesis containing further details of literature review, methods and results can also be provided on request.
